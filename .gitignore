@@ -1,0 +1,5 @@
+data/store.json
+data/uploads/
+data/prototypes/
+*.log
+.DS_Store
