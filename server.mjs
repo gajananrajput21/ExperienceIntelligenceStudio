@@ -4,6 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { closeStorage, initStorage, loadStore, mutate, readPrototypeArchive, savePrototypeArchive, storageHealth, storageKind } from './storage.mjs';
 
 const exec = promisify(execFile);
 const root = path.dirname(new URL(import.meta.url).pathname);
@@ -11,27 +12,17 @@ const publicDir = path.join(root, 'public');
 const dataDir = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(root, 'data');
 const uploadDir = path.join(dataDir, 'uploads');
 const prototypeDir = path.join(dataDir, 'prototypes');
-const storePath = path.join(dataDir, 'store.json');
 const port = Number(process.env.PORT || 4173);
+const adminUser = process.env.ADMIN_USER || 'founder';
+const adminPassword = process.env.ADMIN_PASSWORD || '';
 const MAX_UPLOAD = 25 * 1024 * 1024;
 
+if (process.env.NODE_ENV === 'production' && !adminPassword) {
+  throw new Error('ADMIN_PASSWORD is required in production.');
+}
+
 await Promise.all([fs.mkdir(uploadDir, { recursive: true }), fs.mkdir(prototypeDir, { recursive: true })]);
-
-async function loadStore() {
-  try { return JSON.parse(await fs.readFile(storePath, 'utf8')); }
-  catch { return { projects: [], prototypes: [], studies: [], sessions: [], events: [], responses: [] }; }
-}
-
-let writeQueue = Promise.resolve();
-function mutate(mutator) {
-  writeQueue = writeQueue.then(async () => {
-    const store = await loadStore();
-    const result = await mutator(store);
-    await fs.writeFile(storePath, JSON.stringify(store, null, 2));
-    return result;
-  });
-  return writeQueue;
-}
+await initStorage();
 
 const id = (prefix) => `${prefix}_${crypto.randomBytes(6).toString('hex')}`;
 const now = () => new Date().toISOString();
@@ -39,6 +30,28 @@ const now = () => new Date().toISOString();
 function json(res, status, payload, headers = {}) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...headers });
   res.end(JSON.stringify(payload));
+}
+
+function creatorAuthorized(req) {
+  if (!adminPassword && process.env.NODE_ENV !== 'production') return true;
+  const match = /^Basic (.+)$/i.exec(req.headers.authorization || '');
+  if (!match) return false;
+  let supplied;
+  try { supplied = Buffer.from(match[1], 'base64').toString('utf8'); } catch { return false; }
+  const expected = `${adminUser}:${adminPassword}`;
+  const left = Buffer.from(supplied);
+  const right = Buffer.from(expected);
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+function requestCreatorAuth(res) {
+  res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="Experience Intelligence Studio", charset="UTF-8"', 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+  res.end('Creator sign-in required.');
+}
+
+function publicApiRequest(req, pathname) {
+  return (req.method === 'GET' && (pathname === '/api/health' || /^\/api\/studies\/[^/]+$/.test(pathname)))
+    || (req.method === 'POST' && (pathname === '/api/sessions' || pathname === '/api/events' || /^\/api\/sessions\/[^/]+\/complete$/.test(pathname)));
 }
 
 async function body(req, limit = 1024 * 1024) {
@@ -96,10 +109,24 @@ async function extractZip(fileBuffer, prototypeId) {
   if (!safeArchiveEntries(entries)) throw Object.assign(new Error('The ZIP contains unsafe paths or too many files.'), { status: 400 });
   const indexEntry = entries.find((e) => /(^|\/)index\.html$/i.test(e) && e.split('/').filter(Boolean).length <= 2);
   if (!indexEntry) throw Object.assign(new Error('The ZIP must include an index.html file at its root or inside one top-level folder.'), { status: 400 });
+  await fs.rm(destination, { recursive: true, force: true });
   await fs.mkdir(destination, { recursive: true });
   await exec('unzip', ['-q', zipPath, '-d', destination]);
-  const base = path.dirname(indexEntry);
-  return base === '.' ? destination : path.join(destination, base);
+  const indexRoot = path.dirname(indexEntry);
+  return { basePath: indexRoot === '.' ? destination : path.join(destination, indexRoot), indexRoot };
+}
+
+async function ensurePrototypeMaterialized(prototype) {
+  const destination = path.join(prototypeDir, prototype.id);
+  const basePath = prototype.indexRoot && prototype.indexRoot !== '.' ? path.join(destination, prototype.indexRoot) : destination;
+  try {
+    await fs.access(path.join(basePath, 'index.html'));
+    return basePath;
+  } catch {
+    const archive = await readPrototypeArchive(prototype.id);
+    if (!archive) throw Object.assign(new Error('The prototype archive is unavailable.'), { status: 404 });
+    return (await extractZip(archive, prototype.id)).basePath;
+  }
 }
 
 const tracker = `
@@ -124,9 +151,10 @@ function mime(file) {
 }
 
 async function servePrototype(res, prototype, relativePath) {
+  const basePath = await ensurePrototypeMaterialized(prototype);
   const clean = decodeURIComponent(relativePath || 'index.html').replace(/^\/+/, '');
-  const file = path.resolve(prototype.basePath, clean || 'index.html');
-  if (!file.startsWith(path.resolve(prototype.basePath) + path.sep) && file !== path.resolve(prototype.basePath, 'index.html')) return json(res, 403, { error: 'Forbidden path.' });
+  const file = path.resolve(basePath, clean || 'index.html');
+  if (!file.startsWith(path.resolve(basePath) + path.sep) && file !== path.resolve(basePath, 'index.html')) return json(res, 403, { error: 'Forbidden path.' });
   let stat;
   try { stat = await fs.stat(file); } catch { return json(res, 404, { error: 'Prototype asset not found.' }); }
   const target = stat.isDirectory() ? path.join(file, 'index.html') : file;
@@ -141,6 +169,10 @@ async function servePrototype(res, prototype, relativePath) {
 }
 
 async function api(req, res, url) {
+  if (req.method === 'GET' && url.pathname === '/api/health') {
+    await storageHealth();
+    return json(res, 200, { status: 'ok', storage: storageKind });
+  }
   if (req.method === 'GET' && url.pathname === '/api/state') {
     const store = await loadStore();
     return json(res, 200, { projects: store.projects, prototypes: store.prototypes.map(({ basePath, ...p }) => p), studies: store.studies, sessions: store.sessions });
@@ -150,24 +182,26 @@ async function api(req, res, url) {
     const file = fields.file;
     if (!file?.filename?.toLowerCase().endsWith('.zip')) return json(res, 400, { error: 'Upload a .zip file.' });
     const prototypeId = id('proto');
-    const basePath = await extractZip(file.buffer, prototypeId);
+    const { indexRoot } = await extractZip(file.buffer, prototypeId);
+    await savePrototypeArchive(prototypeId, file.buffer);
     const projectName = String(fields.projectName || 'Untitled project').trim().slice(0, 80);
     const result = await mutate((store) => {
       const project = { id: id('project'), name: projectName, createdAt: now() };
-      const prototype = { id: prototypeId, projectId: project.id, name: file.filename.replace(/\.zip$/i,''), version: 1, status: 'ready', basePath, createdAt: now() };
+      const prototype = { id: prototypeId, projectId: project.id, name: file.filename.replace(/\.zip$/i,''), version: 1, status: 'ready', indexRoot, createdAt: now() };
       store.projects.push(project); store.prototypes.push(prototype);
-      return { project, prototype: { ...prototype, basePath: undefined } };
+      return { project, prototype };
     });
     return json(res, 201, result);
   }
   if (req.method === 'POST' && url.pathname === '/api/demo') {
     const sample = await fs.readFile(path.join(root, 'samples', 'support-dashboard.zip'));
-    const prototypeId = id('proto'); const basePath = await extractZip(sample, prototypeId);
+    const prototypeId = id('proto'); const { indexRoot } = await extractZip(sample, prototypeId);
+    await savePrototypeArchive(prototypeId, sample);
     const result = await mutate((store) => {
       const project = { id: id('project'), name: 'Support quality prototype', createdAt: now() };
-      const prototype = { id: prototypeId, projectId: project.id, name: 'Support dashboard', version: 1, status: 'ready', basePath, createdAt: now() };
+      const prototype = { id: prototypeId, projectId: project.id, name: 'Support dashboard', version: 1, status: 'ready', indexRoot, createdAt: now() };
       store.projects.push(project); store.prototypes.push(prototype);
-      return { project, prototype: { ...prototype, basePath: undefined } };
+      return { project, prototype };
     });
     return json(res, 201, result);
   }
@@ -239,7 +273,10 @@ async function api(req, res, url) {
 async function handle(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   try {
-    if (url.pathname.startsWith('/api/')) return await api(req, res, url);
+    if (url.pathname.startsWith('/api/')) {
+      if (!publicApiRequest(req, url.pathname) && !creatorAuthorized(req)) return requestCreatorAuth(res);
+      return await api(req, res, url);
+    }
     const protoMatch = /^\/prototype\/([^/]+)\/?(.*)$/.exec(url.pathname);
     if (protoMatch) {
       const store = await loadStore(); const prototype = store.prototypes.find((p) => p.id === protoMatch[1]);
@@ -247,6 +284,7 @@ async function handle(req, res) {
       return await servePrototype(res, prototype, protoMatch[2] || 'index.html');
     }
     const requested = url.pathname === '/' || url.pathname.startsWith('/test/') ? 'index.html' : url.pathname.slice(1);
+    if (requested === 'index.html' && !url.pathname.startsWith('/test/') && !creatorAuthorized(req)) return requestCreatorAuth(res);
     const target = path.resolve(publicDir, requested);
     if (!target.startsWith(publicDir)) return json(res, 403, { error: 'Forbidden.' });
     try { const content = await fs.readFile(target); res.writeHead(200, { 'Content-Type': mime(target), 'Cache-Control': requested === 'index.html' ? 'no-store' : 'public, max-age=3600' }); return res.end(content); }
@@ -257,4 +295,14 @@ async function handle(req, res) {
   }
 }
 
-http.createServer(handle).listen(port, () => console.log(`Experience Intelligence Studio running at http://localhost:${port}`));
+const server = http.createServer(handle).listen(port, () => console.log(`Experience Intelligence Studio running at http://localhost:${port} with ${storageKind} storage`));
+
+async function shutdown() {
+  server.close(async () => {
+    await closeStorage();
+    process.exit(0);
+  });
+}
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
