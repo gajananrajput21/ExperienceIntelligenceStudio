@@ -54,6 +54,8 @@ try {
 
   const home = await textRequest('/');
   if (!home.includes('Experience Intelligence Studio')) throw new Error('Creator application did not load.');
+  const clientScript = await textRequest('/app.js');
+  if (!clientScript.includes('I completed this task') || !clientScript.includes('participant_marked_complete')) throw new Error('Participant completion fallback was not available.');
 
   const demo = await request('/api/demo', { method: 'POST' }, ownerCookie);
   const prototypeResponse = await rawRequest(`/prototype/${demo.prototype.id}/index.html`);

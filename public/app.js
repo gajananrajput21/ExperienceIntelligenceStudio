@@ -86,7 +86,7 @@ async function renderParticipant(studyId){
 async function startParticipant(study,prototype){
   const session=await api('/api/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({studyId:study.id})});
   let sequence=0; const started=Date.now(); let complete=false;
-  app.innerHTML=`<main class="test-shell"><div class="test-top"><strong>${escapeHtml(study.title)}</strong><span class="pill green">Task in progress</span></div><section class="test-card"><div class="task-strip"><div><div class="eyebrow">Your task</div><strong>${escapeHtml(study.task.instruction)}</strong>${study.task.scenario?`<p>${escapeHtml(study.task.scenario)}</p>`:''}</div><button class="btn" id="give-up">I cannot complete this</button></div><div class="test-frame-wrap"><div id="prototype-status" class="prototype-status" role="status" aria-live="polite"><strong>Loading prototype…</strong><span>Large HTML prototypes can take a few seconds.</span></div><iframe id="runner" class="test-frame" sandbox="allow-scripts allow-forms allow-modals" src="/prototype/${prototype.id}/index.html"></iframe></div></section></main>`;
+  app.innerHTML=`<main class="test-shell"><div class="test-top"><strong>${escapeHtml(study.title)}</strong><span class="pill green">Task in progress</span></div><section class="test-card"><div class="task-strip"><div><div class="eyebrow">Your task</div><strong>${escapeHtml(study.task.instruction)}</strong>${study.task.scenario?`<p>${escapeHtml(study.task.scenario)}</p>`:''}</div><div class="task-actions"><button class="btn primary" id="mark-complete">I completed this task</button><button class="btn" id="give-up">I cannot complete this</button></div></div><div class="test-frame-wrap"><div id="prototype-status" class="prototype-status" role="status" aria-live="polite"><strong>Loading prototype…</strong><span>Large HTML prototypes can take a few seconds.</span></div><iframe id="runner" class="test-frame" sandbox="allow-scripts allow-forms allow-modals" src="/prototype/${prototype.id}/index.html"></iframe></div></section></main>`;
   const runner=document.querySelector('#runner'); const prototypeStatus=document.querySelector('#prototype-status'); let loadTimer;
   const showLoadFailure=()=>{prototypeStatus.innerHTML='<strong>The prototype did not load</strong><span>Reload it to try again, or end the task if the problem continues.</span><button class="btn small" id="retry-prototype">Reload prototype</button>';prototypeStatus.classList.add('failed');document.querySelector('#retry-prototype').onclick=()=>{prototypeStatus.classList.remove('failed');prototypeStatus.innerHTML='<strong>Loading prototype…</strong><span>Large HTML prototypes can take a few seconds.</span>';runner.src=runner.src;armLoadTimer();};};
   const armLoadTimer=()=>{clearTimeout(loadTimer);loadTimer=setTimeout(showLoadFailure,30000);}; armLoadTimer();
@@ -104,7 +104,16 @@ async function startParticipant(study,prototype){
     if(type==='custom_event'&&study.task.successSelector===`event:${detail.name}`){ complete=true; await record('success_rule_met',{event:detail.name},Date.now()-started);window.removeEventListener('message',listener);renderSurvey(study,session,started,'success'); }
   };
   window.addEventListener('message',listener);
-  document.querySelector('#give-up').onclick=()=>{complete=true;clearTimeout(loadTimer);window.removeEventListener('message',listener);renderSurvey(study,session,started,'failed');};
+  async function finishTask(outcome,eventType){
+    if(complete)return;
+    complete=true; clearTimeout(loadTimer);
+    document.querySelectorAll('.task-actions button').forEach(button=>button.disabled=true);
+    window.removeEventListener('message',listener);
+    try{await record(eventType,{method:'participant_confirmation'},Date.now()-started);}catch(error){console.warn('Could not record completion event',error);}
+    renderSurvey(study,session,started,outcome);
+  }
+  document.querySelector('#mark-complete').onclick=e=>{e.currentTarget.textContent='Completing…';finishTask('success','participant_marked_complete');};
+  document.querySelector('#give-up').onclick=e=>{e.currentTarget.textContent='Ending task…';finishTask('failed','participant_could_not_complete');};
 }
 function renderSurvey(study,session,started,outcome){
   let ease=0,confidence=0;
