@@ -241,6 +241,10 @@ const tracker = `
   document.addEventListener('input', (event) => send('input_changed', { ...describe(event.target), inputType: event.target.type || null, valueLength: String(event.target.value || '').length }), true);
   addEventListener('hashchange', () => send('navigation', { url: location.pathname + location.hash }));
   addEventListener('error', (event) => send('error_triggered', { message: String(event.message || 'Runtime error').slice(0, 160) }));
+  addEventListener('load', () => setTimeout(() => {
+    const visible = Boolean((document.body?.innerText || '').trim() || document.querySelector('img,svg,canvas,video,button,input,select,textarea,[role]'));
+    send('prototype_ready', { visible });
+  }, 1500), { once: true });
   window.EIS = { complete: (name = 'task-completed', detail = {}) => send('custom_event', { name, ...detail }) };
   send('screen_viewed', { url: location.pathname + location.hash, title: document.title });
 })();
@@ -265,7 +269,7 @@ async function servePrototype(res, prototype, relativePath) {
     html = /<\/body>/i.test(html) ? html.replace(/<\/body>/i, `${tracker}</body>`) : `${html}${tracker}`;
     content = Buffer.from(html);
   }
-  res.writeHead(200, { 'Content-Type': mime(target), 'Content-Security-Policy': "default-src 'self' data: blob:; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'none'; frame-ancestors 'self'", 'Cache-Control':'no-store' });
+  res.writeHead(200, { 'Content-Type': mime(target), 'Content-Security-Policy': "default-src 'self' data: blob:; script-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'self' 'unsafe-inline' data: blob:; img-src 'self' data: blob:; font-src 'self' data: blob:; worker-src 'self' data: blob:; connect-src 'none'; frame-ancestors 'self'", 'Cache-Control':'no-store' });
   res.end(content);
 }
 

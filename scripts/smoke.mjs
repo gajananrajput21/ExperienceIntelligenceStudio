@@ -56,8 +56,11 @@ try {
   if (!home.includes('Experience Intelligence Studio')) throw new Error('Creator application did not load.');
 
   const demo = await request('/api/demo', { method: 'POST' }, ownerCookie);
-  const prototypeHtml = await textRequest(`/prototype/${demo.prototype.id}/index.html`);
+  const prototypeResponse = await rawRequest(`/prototype/${demo.prototype.id}/index.html`);
+  const prototypeHtml = await prototypeResponse.text();
+  if (!prototypeResponse.headers.get('content-security-policy')?.includes("script-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:")) throw new Error('Prototype CSP did not allow embedded module scripts.');
   if (!prototypeHtml.includes("source: 'eis-prototype'")) throw new Error('Prototype tracker was not injected.');
+  if (!prototypeHtml.includes("send('prototype_ready', { visible })")) throw new Error('Prototype readiness reporting was not injected.');
   await rm(path.join(dataDir, 'prototypes', demo.prototype.id), { recursive: true, force: true });
   const restoredPrototypeHtml = await textRequest(`/prototype/${demo.prototype.id}/index.html`);
   if (!restoredPrototypeHtml.includes("source: 'eis-prototype'")) throw new Error('Prototype was not restored from its persistent archive.');
