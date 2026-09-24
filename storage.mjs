@@ -7,7 +7,12 @@ const dataDir = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path
 const storePath = path.join(dataDir, 'store.json');
 const archiveDir = path.join(dataDir, 'archives');
 const databaseUrl = process.env.DATABASE_URL;
-const emptyStore = () => ({ projects: [], prototypes: [], studies: [], sessions: [], events: [], responses: [] });
+const collections = ['projects', 'prototypes', 'studies', 'sessions', 'events', 'responses', 'users', 'workspaces', 'memberships', 'invites', 'authSessions'];
+const emptyStore = () => Object.fromEntries(collections.map((key) => [key, []]));
+const normalizeStore = (store = {}) => {
+  for (const key of collections) if (!Array.isArray(store[key])) store[key] = [];
+  return store;
+};
 
 let pool;
 let writeQueue = Promise.resolve();
@@ -43,14 +48,14 @@ export async function initStorage() {
 
 export async function loadStore() {
   if (!pool) {
-    try { return JSON.parse(await fs.readFile(storePath, 'utf8')); }
+    try { return normalizeStore(JSON.parse(await fs.readFile(storePath, 'utf8'))); }
     catch (error) {
       if (error.code === 'ENOENT') return emptyStore();
       throw error;
     }
   }
   const result = await pool.query('SELECT data FROM eis_state WHERE id = 1');
-  return result.rows[0]?.data || emptyStore();
+  return normalizeStore(result.rows[0]?.data || emptyStore());
 }
 
 export function mutate(mutator) {
@@ -69,7 +74,7 @@ export function mutate(mutator) {
     try {
       await client.query('BEGIN');
       const selected = await client.query('SELECT data FROM eis_state WHERE id = 1 FOR UPDATE');
-      const store = selected.rows[0]?.data || emptyStore();
+      const store = normalizeStore(selected.rows[0]?.data || emptyStore());
       const result = await mutator(store);
       await client.query('UPDATE eis_state SET data = $1::jsonb, updated_at = NOW() WHERE id = 1', [JSON.stringify(store)]);
       await client.query('COMMIT');

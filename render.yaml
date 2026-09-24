@@ -13,6 +13,10 @@ services:
         value: production
       - key: ADMIN_USER
         value: founder
+      - key: OWNER_NAME
+        value: Workspace owner
+      - key: WORKSPACE_NAME
+        value: Experience Intelligence team
       - key: ADMIN_PASSWORD
         sync: false
       - key: DATABASE_URL
