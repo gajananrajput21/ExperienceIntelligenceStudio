@@ -60,13 +60,14 @@ export async function loadStore() {
 
 export function mutate(mutator) {
   if (!pool) {
-    writeQueue = writeQueue.then(async () => {
+    const operation = writeQueue.catch(() => undefined).then(async () => {
       const store = await loadStore();
       const result = await mutator(store);
       await fs.writeFile(storePath, JSON.stringify(store, null, 2));
       return result;
     });
-    return writeQueue;
+    writeQueue = operation.then(() => undefined, () => undefined);
+    return operation;
   }
 
   return (async () => {

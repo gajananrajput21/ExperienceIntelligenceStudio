@@ -55,7 +55,9 @@ try {
   const home = await textRequest('/');
   if (!home.includes('Experience Intelligence Studio')) throw new Error('Creator application did not load.');
   const clientScript = await textRequest('/app.js');
-  if (!clientScript.includes('I completed this task') || !clientScript.includes('participant_marked_complete')) throw new Error('Participant completion fallback was not available.');
+  if (!clientScript.includes('I completed this task') || !clientScript.includes('participant_marked_complete') || !clientScript.includes('participantTarget')) throw new Error('Participant completion and target controls were not available.');
+  const styles = await textRequest('/styles.css');
+  if (!styles.includes('Liquid glass blue visual system')) throw new Error('Liquid-glass theme was not served.');
 
   const demo = await request('/api/demo', { method: 'POST' }, ownerCookie);
   const prototypeResponse = await rawRequest(`/prototype/${demo.prototype.id}/index.html`);
@@ -129,6 +131,9 @@ try {
       scenario: 'You are reviewing support quality.',
       instruction: 'Open the evaluation for the interaction that needs review.',
       successSelector: '#open-evaluation',
+      participantTarget: 50,
+      metrics: ['task_success_rate', 'time_on_task', 'click_count', 'ease', 'confidence', 'session_replay'],
+      customQuestion: 'What attracted your attention first?',
     }),
   }, ownerCookie);
   await request(`/api/studies/${study.id}`);
@@ -140,12 +145,20 @@ try {
   await request('/api/events', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(event) });
   await request(`/api/sessions/${session.id}/complete`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ outcome: 'success', durationMs: 5200, response: { ease: 6, confidence: 5, comment: 'Clear task' } }),
+    body: JSON.stringify({ outcome: 'success', durationMs: 5200, response: { ease: 6, confidence: 5, comment: 'Clear task', customAnswer: 'The highlighted evaluation' } }),
   });
   const results = await request(`/api/studies/${study.id}/results`, {}, viewerCookie);
-  if (results.metrics.participants !== 1 || results.metrics.successRate !== 100 || results.metrics.totalEvents !== 1) throw new Error('Unexpected result metrics.');
-  if (results.sessions[0].response.ease !== 6) throw new Error('Post-task response was not stored.');
+  if (results.metrics.participants !== 1 || results.metrics.participantTarget !== 50 || results.metrics.participantProgress !== 2 || results.metrics.taskSuccessRate !== 100 || results.metrics.successRate !== 100 || results.metrics.totalEvents !== 1 || results.metrics.averageClicks !== 1) throw new Error('Unexpected result metrics.');
+  if (!results.study.measurementPlan.metrics.includes('session_replay')) throw new Error('Study measurement plan was not stored.');
+  if (results.sessions[0].response.ease !== 6 || results.sessions[0].response.customAnswer !== 'The highlighted evaluation') throw new Error('Post-task response was not stored.');
   if ((await rawRequest(`/api/studies/${study.id}/results`, {}, researcherCookie)).status !== 403) throw new Error('Researcher could access another member’s private results.');
+
+  const limitedStudy = await request('/api/studies', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prototypeId: demo.prototype.id, title: 'Limited pilot', instruction: 'Complete the task.', successSelector: '#open-evaluation', participantTarget: 1, metrics: ['task_success_rate'] }),
+  }, ownerCookie);
+  await request('/api/sessions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ studyId: limitedStudy.id }) });
+  if ((await rawRequest('/api/sessions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ studyId: limitedStudy.id }) })).status !== 409) throw new Error('Participant target did not close the study link.');
 
   const team = await request('/api/team', {}, ownerCookie);
   const manager = team.members.find((member) => member.email === 'manager@example.com');

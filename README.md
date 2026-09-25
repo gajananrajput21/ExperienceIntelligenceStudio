@@ -9,14 +9,17 @@ Working proof of concept for turning a runnable HTML prototype into a measurable
 - Run the prototype inside a sandboxed participant frame
 - Create a task with a CSS-selector success condition
 - Publish and copy a participant test link
+- Set a study recruitment target (50 participants by default) with automatic link closure and progress tracking
 - Capture clicks, navigation, forms, masked input metadata and runtime errors
-- Calculate task success and completion time
-- Collect task ease, confidence and optional comments
-- Review participant-level evidence timelines
+- Let researchers select a measurement plan for each study, including task success rate, time, clicks, path efficiency, misclicks, hesitation, ease and confidence
+- Calculate and display only the metrics selected for that study
+- Collect study-specific ratings, comments and an optional custom post-task question
+- Watch a privacy-safe, video-like interaction replay with click and dwell maps, or review the chronological evidence timeline
 - Persist study data and uploaded prototype archives in PostgreSQL when deployed
 - Invite UX researchers and managers into a private team workspace
 - Keep researcher projects separated while Owners and Viewers can review workspace-wide results
 - Let participants complete public studies without creating an account
+- Use a responsive light/deep-blue liquid-glass interface across researcher, manager and participant experiences
 
 ## Team accounts and roles
 
@@ -78,6 +81,8 @@ The creator workspace and results APIs use account sessions and server-enforced 
 
 - No self-service forgotten-password email flow; an Owner can remove and reinvite a teammate while preserving their projects
 - One organization workspace rather than multiple organizations per account
+- Session replay reconstructs masked interaction events; it is not a camera, microphone or full screen recording
+- Misclick, hesitation, backtracking and dwell measurements are system-inferred behavioral signals and require researcher interpretation
 - Pilot-scale JSONB state model rather than normalized analytics tables
 - CSS selector success matching currently supports element IDs and `data-testid`
 - Evidence timeline instead of full DOM replay

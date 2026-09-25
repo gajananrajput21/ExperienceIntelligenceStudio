@@ -21,6 +21,8 @@ const workspaceName = process.env.WORKSPACE_NAME || 'Experience Intelligence tea
 const MAX_UPLOAD = 25 * 1024 * 1024;
 const SESSION_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const INVITE_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const DEFAULT_METRICS = ['task_success_rate','time_on_task','click_count','misclicks','hesitation','ease','confidence','session_replay'];
+const ALLOWED_METRICS = new Set([...DEFAULT_METRICS,'path_efficiency','backtracking','drop_off_rate','completion_method','click_map','dwell_map']);
 
 if (process.env.NODE_ENV === 'production' && !adminPassword) {
   throw new Error('ADMIN_PASSWORD is required in production.');
@@ -236,11 +238,29 @@ const tracker = `
   const started = Date.now();
   const send = (type, detail = {}) => parent.postMessage({ source: 'eis-prototype', type, detail, at: Date.now(), elapsedMs: Date.now() - started }, '*');
   const describe = (el) => ({ tag: el.tagName?.toLowerCase(), id: el.id || null, role: el.getAttribute?.('role'), testId: el.getAttribute?.('data-testid'), text: (el.innerText || el.getAttribute?.('aria-label') || '').trim().slice(0, 100) });
-  document.addEventListener('click', (event) => send('element_clicked', { ...describe(event.target), x: event.clientX, y: event.clientY }), true);
+  const viewport = () => ({ viewportWidth: innerWidth, viewportHeight: innerHeight });
+  let interactionPending = false;
+  document.addEventListener('click', (event) => { interactionPending = true; setTimeout(() => { interactionPending = false; }, 2000); send('element_clicked', { ...describe(event.target), x: event.clientX, y: event.clientY, ...viewport() }); }, true);
   document.addEventListener('submit', (event) => send('form_submitted', describe(event.target)), true);
   document.addEventListener('input', (event) => send('input_changed', { ...describe(event.target), inputType: event.target.type || null, valueLength: String(event.target.value || '').length }), true);
+  let pauseTimer; let lastPointer = null;
+  document.addEventListener('pointermove', (event) => { lastPointer = { x: event.clientX, y: event.clientY, ...viewport() }; clearTimeout(pauseTimer); pauseTimer = setTimeout(() => send('pointer_pause', { ...lastPointer, durationMs: 1200 }), 1200); }, { passive: true });
+  let scrollTimer;
+  document.addEventListener('scroll', () => { clearTimeout(scrollTimer); scrollTimer = setTimeout(() => send('scroll_changed', { x: scrollX, y: scrollY, ...viewport() }), 500); }, { passive: true });
+  new MutationObserver(() => { if (interactionPending) { interactionPending = false; send('interface_changed', { url: location.pathname + location.hash }); } }).observe(document.documentElement, { childList: true, subtree: true, attributes: true });
   addEventListener('hashchange', () => send('navigation', { url: location.pathname + location.hash }));
   addEventListener('error', (event) => send('error_triggered', { message: String(event.message || 'Runtime error').slice(0, 160) }));
+  addEventListener('message', (event) => {
+    if (event.data?.source !== 'eis-replay') return;
+    const replay = event.data.event;
+    if (replay?.type === 'scroll_changed') scrollTo(replay.detail?.x || 0, replay.detail?.y || 0);
+    if (replay?.type === 'element_clicked') {
+      const detail = replay.detail || {};
+      const candidates = Array.from(document.querySelectorAll(detail.tag || '*'));
+      const target = (detail.id && document.getElementById(detail.id)) || candidates.find((el) => detail.testId && el.getAttribute('data-testid') === detail.testId) || candidates.find((el) => detail.text && (el.innerText || el.getAttribute('aria-label') || '').trim().includes(detail.text));
+      target?.click();
+    }
+  });
   addEventListener('load', () => setTimeout(() => {
     const visible = Boolean((document.body?.innerText || '').trim() || document.querySelector('img,svg,canvas,video,button,input,select,textarea,[role]'));
     send('prototype_ready', { visible });
@@ -449,7 +469,8 @@ async function api(req, res, url, auth = null) {
       if (!prototype) throw Object.assign(new Error('Prototype not found.'), { status: 404 });
       const project = store.projects.find((item) => item.id === prototype.projectId);
       requirePermission(canAccessProject(auth, project));
-      const study = { id: id('study'), projectId: prototype.projectId, prototypeId: prototype.id, createdBy: auth.user.id, title: String(input.title).slice(0,100), status: 'published', createdAt: now(), task: { id: id('task'), scenario: String(input.scenario || '').slice(0,500), instruction: String(input.instruction).slice(0,500), successSelector: String(input.successSelector).slice(0,160) } };
+      const selectedMetrics = Array.isArray(input.metrics) ? input.metrics.filter((metric) => ALLOWED_METRICS.has(metric)) : DEFAULT_METRICS;
+      const study = { id: id('study'), projectId: prototype.projectId, prototypeId: prototype.id, createdBy: auth.user.id, title: String(input.title).slice(0,100), status: 'published', participantTarget: Math.max(1, Math.min(500, Number(input.participantTarget || 50))), createdAt: now(), measurementPlan: { metrics: selectedMetrics.length ? [...new Set(selectedMetrics)] : DEFAULT_METRICS, expectedActionCount: Math.max(0, Math.min(100, Number(input.expectedActionCount || 0))), customQuestion: String(input.customQuestion || '').trim().slice(0,300) }, task: { id: id('task'), scenario: String(input.scenario || '').slice(0,500), instruction: String(input.instruction).slice(0,500), successSelector: String(input.successSelector).slice(0,160) } };
       store.studies.push(study); return study;
     });
     return json(res, 201, result);
@@ -471,12 +492,25 @@ async function api(req, res, url, auth = null) {
     const completed = sessions.filter((s) => s.outcome === 'success');
     const avg = completed.length ? Math.round(completed.reduce((sum,s) => sum + (s.durationMs || 0), 0) / completed.length / 1000) : 0;
     const bySession = sessions.map((s) => ({ ...s, events: events.filter((e) => e.sessionId === s.id).sort((a,b) => a.sequence - b.sequence), response: store.responses.find((r) => r.sessionId === s.id) || null }));
-    return json(res, 200, { study, metrics: { participants: sessions.length, successRate: sessions.length ? Math.round(completed.length / sessions.length * 100) : 0, averageSuccessTimeSeconds: avg, totalEvents: events.length }, sessions: bySession });
+    const clicks = events.filter((event) => event.type === 'element_clicked');
+    const supportingTypes = new Set(['interface_changed','navigation','form_submitted','custom_event','success_rule_met']);
+    const misclicks = bySession.reduce((total, session) => total + session.events.filter((event, index, list) => event.type === 'element_clicked' && !list.slice(index + 1).some((next) => next.elapsedMs - event.elapsedMs <= 2000 && supportingTypes.has(next.type))).length, 0);
+    const backtracks = bySession.reduce((total, session) => { const navigations = session.events.filter((event) => event.type === 'navigation').map((event) => event.detail?.url).filter(Boolean); return total + navigations.filter((url, index) => navigations.slice(0,index).includes(url)).length; }, 0);
+    const responses = bySession.map((session) => session.response).filter(Boolean);
+    const average = (values) => values.length ? Math.round(values.reduce((sum,value) => sum + value, 0) / values.length * 10) / 10 : 0;
+    const expectedActions = Number(study.measurementPlan?.expectedActionCount || 0);
+    const averageClicks = sessions.length ? Math.round(clicks.length / sessions.length * 10) / 10 : 0;
+    const participantTarget = Number(study.participantTarget || 50);
+    const metrics = { participants: sessions.length, participantTarget, participantProgress: Math.min(100, Math.round(sessions.length / participantTarget * 100)), taskSuccessRate: sessions.length ? Math.round(completed.length / sessions.length * 100) : 0, successRate: sessions.length ? Math.round(completed.length / sessions.length * 100) : 0, averageSuccessTimeSeconds: avg, totalEvents: events.length, averageClicks, misclicks, hesitationCount: events.filter((event) => event.type === 'pointer_pause').length, backtracks, dropOffRate: sessions.length ? Math.round(sessions.filter((session) => session.outcome !== 'success').length / sessions.length * 100) : 0, averageEase: average(responses.map((response) => Number(response.ease)).filter(Boolean)), averageConfidence: average(responses.map((response) => Number(response.confidence)).filter(Boolean)), pathEfficiency: expectedActions && averageClicks ? Math.min(100, Math.round(expectedActions / averageClicks * 100)) : 0, automaticCompletions: events.filter((event) => event.type === 'success_rule_met').length, participantConfirmedCompletions: events.filter((event) => event.type === 'participant_marked_complete').length };
+    return json(res, 200, { study, metrics, sessions: bySession });
   }
   if (req.method === 'POST' && url.pathname === '/api/sessions') {
     const input = await jsonBody(req);
     const result = await mutate((store) => {
-      if (!store.studies.some((s) => s.id === input.studyId)) throw Object.assign(new Error('Study not found.'), { status: 404 });
+      const study = store.studies.find((item) => item.id === input.studyId);
+      if (!study) throw Object.assign(new Error('Study not found.'), { status: 404 });
+      const participantTarget = Number(study.participantTarget || 50);
+      if (store.sessions.filter((session) => session.studyId === study.id).length >= participantTarget) throw Object.assign(new Error(`This study has reached its ${participantTarget}-participant target.`), { status: 409 });
       const session = { id: id('session'), studyId: input.studyId, startedAt: now(), endedAt: null, outcome: 'in_progress', durationMs: null, eventCount: 0 };
       store.sessions.push(session); return session;
     });
@@ -501,7 +535,7 @@ async function api(req, res, url, auth = null) {
       const session = store.sessions.find((s) => s.id === completeMatch[1]);
       if (!session) throw Object.assign(new Error('Session not found.'), { status: 404 });
       session.endedAt = now(); session.outcome = input.outcome || 'success'; session.durationMs = Number(input.durationMs || 0);
-      if (input.response) store.responses.push({ id:id('response'), sessionId:session.id, ease:Number(input.response.ease), confidence:Number(input.response.confidence), comment:String(input.response.comment || '').slice(0,1000), createdAt:now() });
+      if (input.response) store.responses.push({ id:id('response'), sessionId:session.id, ease:Number(input.response.ease || 0), confidence:Number(input.response.confidence || 0), comment:String(input.response.comment || '').slice(0,1000), customAnswer:String(input.response.customAnswer || '').slice(0,1000), createdAt:now() });
       return session;
     });
     return json(res, 200, result);
