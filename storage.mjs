@@ -114,6 +114,14 @@ export async function readPrototypeArchive(prototypeId) {
   return result.rows[0]?.archive || null;
 }
 
+export async function deletePrototypeArchive(prototypeId) {
+  if (!pool) {
+    await fs.rm(path.join(archiveDir, `${prototypeId}.zip`), { force: true });
+    return;
+  }
+  await pool.query('DELETE FROM eis_prototype_archives WHERE prototype_id = $1', [prototypeId]);
+}
+
 export async function storageHealth() {
   if (!pool) return true;
   await pool.query('SELECT 1');

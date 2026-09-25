@@ -92,10 +92,10 @@ try {
 
   const researcherInvite = await request('/api/team/invites', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email: 'researcher@example.com', role: 'researcher' }),
+    body: JSON.stringify({ email: 'researcher@example.com', role: 'researcher', accessDays: 60 }),
   }, ownerCookie);
   const inviteDetails = await request(`/api/invites/${researcherInvite.token}`);
-  if (inviteDetails.role !== 'researcher') throw new Error('Researcher invitation was not readable.');
+  if (inviteDetails.role !== 'researcher' || inviteDetails.accessDays !== 60) throw new Error('Researcher invitation was not readable.');
   const researcherResponse = await rawRequest(`/api/invites/${researcherInvite.token}/accept`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name: 'Researcher One', password: 'researcher-password' }),
@@ -112,7 +112,7 @@ try {
 
   const viewerInvite = await request('/api/team/invites', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email: 'manager@example.com', role: 'viewer' }),
+    body: JSON.stringify({ email: 'manager@example.com', role: 'viewer', accessDays: 180 }),
   }, ownerCookie);
   const viewerResponse = await rawRequest(`/api/invites/${viewerInvite.token}/accept`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -132,6 +132,8 @@ try {
       instruction: 'Open the evaluation for the interaction that needs review.',
       successSelector: '#open-evaluation',
       participantTarget: 50,
+      expectedActionCount: 1,
+      targetTimeSeconds: 6,
       metrics: ['task_success_rate', 'time_on_task', 'click_count', 'ease', 'confidence', 'session_replay'],
       customQuestion: 'What attracted your attention first?',
     }),
@@ -150,8 +152,15 @@ try {
   const results = await request(`/api/studies/${study.id}/results`, {}, viewerCookie);
   if (results.metrics.participants !== 1 || results.metrics.participantTarget !== 50 || results.metrics.participantProgress !== 2 || results.metrics.taskSuccessRate !== 100 || results.metrics.successRate !== 100 || results.metrics.totalEvents !== 1 || results.metrics.averageClicks !== 1) throw new Error('Unexpected result metrics.');
   if (!results.study.measurementPlan.metrics.includes('session_replay')) throw new Error('Study measurement plan was not stored.');
+  if (results.study.measurementPlan.targetTimeSeconds !== 6) throw new Error('Study benchmark target was not stored.');
   if (results.sessions[0].response.ease !== 6 || results.sessions[0].response.customAnswer !== 'The highlighted evaluation') throw new Error('Post-task response was not stored.');
   if ((await rawRequest(`/api/studies/${study.id}/results`, {}, researcherCookie)).status !== 403) throw new Error('Researcher could access another member’s private results.');
+  if ((await rawRequest(`/api/sessions/${session.id}`, { method: 'DELETE' }, viewerCookie)).status !== 403) throw new Error('Viewer could delete a participant record.');
+  await request(`/api/studies/${study.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: 'Updated study title', participantTarget: 55, metrics: results.study.measurementPlan.metrics, expectedActionCount: 1, targetTimeSeconds: 6 }) }, ownerCookie);
+  const updatedResults = await request(`/api/studies/${study.id}/results`, {}, ownerCookie);
+  if (updatedResults.study.title !== 'Updated study title' || updatedResults.study.participantTarget !== 55) throw new Error('Study edit did not persist.');
+  await request(`/api/sessions/${session.id}`, { method: 'DELETE' }, ownerCookie);
+  if ((await request(`/api/studies/${study.id}/results`, {}, ownerCookie)).metrics.participants !== 0) throw new Error('Participant record was not deleted.');
 
   const limitedStudy = await request('/api/studies', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -159,9 +168,18 @@ try {
   }, ownerCookie);
   await request('/api/sessions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ studyId: limitedStudy.id }) });
   if ((await rawRequest('/api/sessions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ studyId: limitedStudy.id }) })).status !== 409) throw new Error('Participant target did not close the study link.');
+  await request(`/api/studies/${limitedStudy.id}`, { method: 'DELETE' }, ownerCookie);
+  if ((await rawRequest(`/api/studies/${limitedStudy.id}`)).status !== 404) throw new Error('Study was not deleted.');
+
+  await request(`/api/projects/${htmlUpload.project.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Renamed prototype project' }) }, ownerCookie);
+  if (!(await request('/api/state', {}, ownerCookie)).projects.some((project) => project.name === 'Renamed prototype project')) throw new Error('Project edit did not persist.');
+  await request(`/api/projects/${htmlUpload.project.id}`, { method: 'DELETE' }, ownerCookie);
+  if ((await rawRequest(`/prototype/${htmlUpload.prototype.id}/index.html`)).status !== 404) throw new Error('Deleted project prototype remained available.');
 
   const team = await request('/api/team', {}, ownerCookie);
   const manager = team.members.find((member) => member.email === 'manager@example.com');
+  if (!manager.accessExpiresAt) throw new Error('Teammate access expiry was not set.');
+  await request(`/api/team/members/${manager.membershipId}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ accessDays: 90 }) }, ownerCookie);
   await request(`/api/team/members/${manager.membershipId}`, { method: 'DELETE' }, ownerCookie);
   if ((await rawRequest('/api/auth/me', {}, viewerCookie)).status !== 401) throw new Error('Removed member session remained active.');
   const reinvite = await request('/api/team/invites', {

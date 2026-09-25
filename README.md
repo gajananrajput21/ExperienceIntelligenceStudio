@@ -13,10 +13,14 @@ Working proof of concept for turning a runnable HTML prototype into a measurable
 - Capture clicks, navigation, forms, masked input metadata and runtime errors
 - Let researchers select a measurement plan for each study, including task success rate, time, clicks, path efficiency, misclicks, hesitation, ease and confidence
 - Calculate and display only the metrics selected for that study
+- Interpret performance metrics with Excellent, Good, Moderate and Needs improvement benchmarks
 - Collect study-specific ratings, comments and an optional custom post-task question
 - Watch a privacy-safe, video-like interaction replay with click and dwell maps, or review the chronological evidence timeline
+- Filter participant sessions by outcome and delete individual records with their associated replay and feedback
+- Edit or permanently delete projects and studies with scoped cascade cleanup
 - Persist study data and uploaded prototype archives in PostgreSQL when deployed
 - Invite UX researchers and managers into a private team workspace
+- Set teammate workspace access for 30–180 days, review expiry dates and renew access when needed
 - Keep researcher projects separated while Owners and Viewers can review workspace-wide results
 - Let participants complete public studies without creating an account
 - Use a responsive light/deep-blue liquid-glass interface across researcher, manager and participant experiences

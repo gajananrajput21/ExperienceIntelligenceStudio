@@ -4,7 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { closeStorage, initStorage, loadStore, mutate, readPrototypeArchive, savePrototypeArchive, storageHealth, storageKind } from './storage.mjs';
+import { closeStorage, deletePrototypeArchive, initStorage, loadStore, mutate, readPrototypeArchive, savePrototypeArchive, storageHealth, storageKind } from './storage.mjs';
 
 const exec = promisify(execFile);
 const root = path.dirname(new URL(import.meta.url).pathname);
@@ -85,6 +85,14 @@ async function ensureBootstrapAccount() {
   });
 }
 
+async function ensureMembershipExpiryDefaults() {
+  await mutate((store) => {
+    for (const membership of store.memberships) {
+      if (membership.role !== 'owner' && !membership.accessExpiresAt) membership.accessExpiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+    }
+  });
+}
+
 async function currentAuth(req) {
   const raw = cookies(req).eis_session;
   if (!raw) return null;
@@ -92,7 +100,7 @@ async function currentAuth(req) {
   const session = store.authSessions.find((item) => item.tokenHash === tokenHash(raw) && new Date(item.expiresAt) > new Date());
   if (!session) return null;
   const user = store.users.find((item) => item.id === session.userId && item.status === 'active');
-  const membership = store.memberships.find((item) => item.userId === user?.id && item.workspaceId === session.workspaceId);
+  const membership = store.memberships.find((item) => item.userId === user?.id && item.workspaceId === session.workspaceId && (!item.accessExpiresAt || new Date(item.accessExpiresAt) > new Date()));
   const workspace = store.workspaces.find((item) => item.id === membership?.workspaceId);
   return user && membership && workspace ? { user, membership, workspace, session } : null;
 }
@@ -117,6 +125,7 @@ function publicApiRequest(req, pathname) {
 }
 
 await ensureBootstrapAccount();
+await ensureMembershipExpiryDefaults();
 
 const loginAttempts = new Map();
 function checkLoginRate(req) {
@@ -308,6 +317,7 @@ async function api(req, res, url, auth = null) {
     if (!user || !(await verifyPassword(password, user.passwordHash))) return json(res, 401, { error: 'The sign-in details are incorrect.' });
     const membership = store.memberships.find((item) => item.userId === user.id);
     if (!membership) return json(res, 403, { error: 'Your account does not have access to a workspace.' });
+    if (membership.accessExpiresAt && new Date(membership.accessExpiresAt) <= new Date()) return json(res, 403, { error: 'Your workspace access has expired. Contact the workspace owner to renew it.' });
     const token = crypto.randomBytes(32).toString('base64url');
     await mutate((draft) => {
       draft.authSessions = draft.authSessions.filter((item) => new Date(item.expiresAt) > new Date());
@@ -329,7 +339,7 @@ async function api(req, res, url, auth = null) {
     const invite = store.invites.find((item) => item.tokenHash === tokenHash(publicInviteMatch[1]));
     if (!invite || invite.status !== 'pending' || new Date(invite.expiresAt) <= new Date()) return json(res, 410, { error: 'This invitation is invalid or has expired.' });
     const workspace = store.workspaces.find((item) => item.id === invite.workspaceId);
-    return json(res, 200, { email: invite.email, role: invite.role, workspaceName: workspace?.name || 'Workspace', expiresAt: invite.expiresAt });
+    return json(res, 200, { email: invite.email, role: invite.role, workspaceName: workspace?.name || 'Workspace', expiresAt: invite.expiresAt, accessDays: invite.accessDays || 30 });
   }
   const acceptInviteMatch = /^\/api\/invites\/([^/]+)\/accept$/.exec(url.pathname);
   if (req.method === 'POST' && acceptInviteMatch) {
@@ -350,7 +360,8 @@ async function api(req, res, url, auth = null) {
       let user = store.users.find((item) => item.email === invite.email && item.status === 'removed');
       if (user) Object.assign(user, { name, passwordHash, status: 'active', reactivatedAt: now() });
       else { user = { id: id('user'), login: invite.email, email: invite.email, name, passwordHash, bootstrapOwner: false, status: 'active', createdAt: now() }; store.users.push(user); }
-      store.memberships.push({ id: id('member'), workspaceId: invite.workspaceId, userId: user.id, role: invite.role, createdAt: now() });
+      const accessDays = Math.max(30, Math.min(180, Number(invite.accessDays || 30)));
+      store.memberships.push({ id: id('member'), workspaceId: invite.workspaceId, userId: user.id, role: invite.role, createdAt: now(), accessExpiresAt: new Date(Date.now() + accessDays * 24 * 60 * 60 * 1000).toISOString() });
       activeInvite.status = 'accepted'; activeInvite.acceptedAt = now(); activeInvite.acceptedBy = user.id;
       store.authSessions.push({ id: id('auth'), tokenHash: tokenHash(rawSession), userId: user.id, workspaceId: invite.workspaceId, createdAt: now(), expiresAt: new Date(Date.now() + SESSION_AGE_MS).toISOString() });
       return safeUser(user);
@@ -372,10 +383,51 @@ async function api(req, res, url, auth = null) {
       sessions: store.sessions.filter((session) => studyIds.has(session.studyId)),
     });
   }
+  const projectAdminMatch = /^\/api\/projects\/([^/]+)$/.exec(url.pathname);
+  if (req.method === 'PATCH' && projectAdminMatch) {
+    requirePermission(canEdit(auth)); const input = await jsonBody(req); const name = String(input.name || '').trim().slice(0,80);
+    if (!name) return json(res, 400, { error: 'Enter a project name.' });
+    const project = await mutate((store) => { const item = store.projects.find((candidate) => candidate.id === projectAdminMatch[1]); requirePermission(canAccessProject(auth,item)); item.name = name; item.updatedAt = now(); return item; });
+    return json(res, 200, project);
+  }
+  if (req.method === 'DELETE' && projectAdminMatch) {
+    requirePermission(canEdit(auth));
+    const prototypeIds = await mutate((store) => {
+      const project = store.projects.find((item) => item.id === projectAdminMatch[1]); requirePermission(canAccessProject(auth,project));
+      const studyIds = new Set(store.studies.filter((study) => study.projectId === project.id).map((study) => study.id));
+      const sessionIds = new Set(store.sessions.filter((session) => studyIds.has(session.studyId)).map((session) => session.id));
+      const prototypeIds = store.prototypes.filter((prototype) => prototype.projectId === project.id).map((prototype) => prototype.id);
+      store.responses = store.responses.filter((response) => !sessionIds.has(response.sessionId)); store.events = store.events.filter((event) => !sessionIds.has(event.sessionId)); store.sessions = store.sessions.filter((session) => !sessionIds.has(session.id)); store.studies = store.studies.filter((study) => !studyIds.has(study.id)); store.prototypes = store.prototypes.filter((prototype) => prototype.projectId !== project.id); store.projects = store.projects.filter((item) => item.id !== project.id);
+      return prototypeIds;
+    });
+    await Promise.all(prototypeIds.map(async (prototypeId) => { await fs.rm(path.join(prototypeDir,prototypeId),{recursive:true,force:true}); await deletePrototypeArchive(prototypeId); }));
+    return json(res, 200, { deleted: true });
+  }
+  const studyAdminMatch = /^\/api\/studies\/([^/]+)$/.exec(url.pathname);
+  if (req.method === 'PATCH' && studyAdminMatch) {
+    requirePermission(canEdit(auth)); const input = await jsonBody(req);
+    const updated = await mutate((store) => {
+      const study = store.studies.find((item) => item.id === studyAdminMatch[1]); if (!study) throw Object.assign(new Error('Study not found.'),{status:404});
+      requirePermission(canAccessProject(auth,store.projects.find((project) => project.id === study.projectId)));
+      const participantCount = store.sessions.filter((session) => session.studyId === study.id).length; const participantTarget = Math.max(1,Math.min(500,Number(input.participantTarget || study.participantTarget || 50)));
+      if (participantTarget < participantCount) throw Object.assign(new Error(`The target cannot be lower than the ${participantCount} existing participant sessions.`),{status:409});
+      const metrics = Array.isArray(input.metrics) ? input.metrics.filter((metric) => ALLOWED_METRICS.has(metric)) : study.measurementPlan?.metrics || DEFAULT_METRICS;
+      study.title = String(input.title || study.title).trim().slice(0,100); study.participantTarget = participantTarget; study.updatedAt = now();
+      study.task = { ...study.task, scenario:String(input.scenario ?? study.task.scenario).slice(0,500), instruction:String(input.instruction || study.task.instruction).slice(0,500), successSelector:String(input.successSelector || study.task.successSelector).slice(0,160) };
+      study.measurementPlan = { metrics:metrics.length?[...new Set(metrics)]:DEFAULT_METRICS, expectedActionCount:Math.max(0,Math.min(100,Number(input.expectedActionCount ?? study.measurementPlan?.expectedActionCount ?? 0))), targetTimeSeconds:Math.max(0,Math.min(7200,Number(input.targetTimeSeconds ?? study.measurementPlan?.targetTimeSeconds ?? 0))), customQuestion:String(input.customQuestion ?? study.measurementPlan?.customQuestion ?? '').trim().slice(0,300) };
+      return study;
+    });
+    return json(res,200,updated);
+  }
+  if (req.method === 'DELETE' && studyAdminMatch) {
+    requirePermission(canEdit(auth));
+    await mutate((store) => { const study = store.studies.find((item) => item.id === studyAdminMatch[1]); if (!study) throw Object.assign(new Error('Study not found.'),{status:404}); requirePermission(canAccessProject(auth,store.projects.find((project) => project.id === study.projectId))); const sessionIds = new Set(store.sessions.filter((session) => session.studyId === study.id).map((session) => session.id)); store.responses=store.responses.filter((response)=>!sessionIds.has(response.sessionId)); store.events=store.events.filter((event)=>!sessionIds.has(event.sessionId)); store.sessions=store.sessions.filter((session)=>!sessionIds.has(session.id)); store.studies=store.studies.filter((item)=>item.id!==study.id); });
+    return json(res,200,{deleted:true});
+  }
   if (req.method === 'GET' && url.pathname === '/api/team') {
     const store = await loadStore();
     const memberships = store.memberships.filter((item) => item.workspaceId === auth.workspace.id);
-    const members = memberships.map((membership) => ({ ...safeUser(store.users.find((user) => user.id === membership.userId)), membershipId: membership.id, role: membership.role }));
+    const members = memberships.map((membership) => ({ ...safeUser(store.users.find((user) => user.id === membership.userId)), membershipId: membership.id, role: membership.role, accessExpiresAt: membership.accessExpiresAt || null, accessExpired: Boolean(membership.accessExpiresAt && new Date(membership.accessExpiresAt) <= new Date()) }));
     const invites = store.invites.filter((item) => item.workspaceId === auth.workspace.id && item.status === 'pending').map(({ tokenHash: omitted, ...invite }) => invite);
     return json(res, 200, { members, invites, canManage: canManageTeam(auth) });
   }
@@ -384,26 +436,32 @@ async function api(req, res, url, auth = null) {
     const input = await jsonBody(req);
     const email = String(input.email || '').trim().toLowerCase().slice(0, 160);
     const role = String(input.role || 'researcher');
+    const accessDays = Number(input.accessDays || 30);
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return json(res, 400, { error: 'Enter a valid email address.' });
     if (!['researcher', 'viewer'].includes(role)) return json(res, 400, { error: 'Select a valid role.' });
+    if (!Number.isInteger(accessDays) || accessDays < 30 || accessDays > 180) return json(res, 400, { error: 'Access duration must be between 30 and 180 days.' });
     const rawToken = crypto.randomBytes(24).toString('base64url');
     const invite = await mutate((store) => {
       if (store.users.some((user) => user.email === email && user.status === 'active') || store.invites.some((item) => item.email === email && item.status === 'pending')) throw Object.assign(new Error('This person is already a member or has a pending invitation.'), { status: 409 });
-      const created = { id: id('invite'), workspaceId: auth.workspace.id, email, role, tokenHash: tokenHash(rawToken), status: 'pending', createdBy: auth.user.id, createdAt: now(), expiresAt: new Date(Date.now() + INVITE_AGE_MS).toISOString() };
+      const created = { id: id('invite'), workspaceId: auth.workspace.id, email, role, accessDays, tokenHash: tokenHash(rawToken), status: 'pending', createdBy: auth.user.id, createdAt: now(), expiresAt: new Date(Date.now() + INVITE_AGE_MS).toISOString() };
       store.invites.push(created); return created;
     });
-    return json(res, 201, { invite: { id: invite.id, email, role, expiresAt: invite.expiresAt }, token: rawToken });
+    return json(res, 201, { invite: { id: invite.id, email, role, accessDays, expiresAt: invite.expiresAt }, token: rawToken });
   }
   const memberMatch = /^\/api\/team\/members\/([^/]+)$/.exec(url.pathname);
   if (req.method === 'PATCH' && memberMatch) {
     requirePermission(canManageTeam(auth));
-    const input = await jsonBody(req); const role = String(input.role || '');
-    if (!['researcher', 'viewer'].includes(role)) return json(res, 400, { error: 'Select Researcher or Viewer.' });
+    const input = await jsonBody(req); const role = input.role ? String(input.role) : '';
+    if (role && !['researcher', 'viewer'].includes(role)) return json(res, 400, { error: 'Select Researcher or Viewer.' });
+    const accessDays = input.accessDays === undefined ? null : Number(input.accessDays);
+    if (accessDays !== null && (!Number.isInteger(accessDays) || accessDays < 30 || accessDays > 180)) return json(res, 400, { error: 'Access duration must be between 30 and 180 days.' });
     const result = await mutate((store) => {
       const membership = store.memberships.find((item) => item.id === memberMatch[1] && item.workspaceId === auth.workspace.id);
       if (!membership) throw Object.assign(new Error('Team member not found.'), { status: 404 });
       if (membership.role === 'owner') throw Object.assign(new Error('The workspace owner role cannot be changed.'), { status: 400 });
-      membership.role = role; return membership;
+      if (role) membership.role = role;
+      if (accessDays !== null) membership.accessExpiresAt = new Date(Date.now() + accessDays * 24 * 60 * 60 * 1000).toISOString();
+      return membership;
     });
     return json(res, 200, result);
   }
@@ -470,7 +528,7 @@ async function api(req, res, url, auth = null) {
       const project = store.projects.find((item) => item.id === prototype.projectId);
       requirePermission(canAccessProject(auth, project));
       const selectedMetrics = Array.isArray(input.metrics) ? input.metrics.filter((metric) => ALLOWED_METRICS.has(metric)) : DEFAULT_METRICS;
-      const study = { id: id('study'), projectId: prototype.projectId, prototypeId: prototype.id, createdBy: auth.user.id, title: String(input.title).slice(0,100), status: 'published', participantTarget: Math.max(1, Math.min(500, Number(input.participantTarget || 50))), createdAt: now(), measurementPlan: { metrics: selectedMetrics.length ? [...new Set(selectedMetrics)] : DEFAULT_METRICS, expectedActionCount: Math.max(0, Math.min(100, Number(input.expectedActionCount || 0))), customQuestion: String(input.customQuestion || '').trim().slice(0,300) }, task: { id: id('task'), scenario: String(input.scenario || '').slice(0,500), instruction: String(input.instruction).slice(0,500), successSelector: String(input.successSelector).slice(0,160) } };
+      const study = { id: id('study'), projectId: prototype.projectId, prototypeId: prototype.id, createdBy: auth.user.id, title: String(input.title).slice(0,100), status: 'published', participantTarget: Math.max(1, Math.min(500, Number(input.participantTarget || 50))), createdAt: now(), measurementPlan: { metrics: selectedMetrics.length ? [...new Set(selectedMetrics)] : DEFAULT_METRICS, expectedActionCount: Math.max(0, Math.min(100, Number(input.expectedActionCount || 0))), targetTimeSeconds: Math.max(0, Math.min(7200, Number(input.targetTimeSeconds || 0))), customQuestion: String(input.customQuestion || '').trim().slice(0,300) }, task: { id: id('task'), scenario: String(input.scenario || '').slice(0,500), instruction: String(input.instruction).slice(0,500), successSelector: String(input.successSelector).slice(0,160) } };
       store.studies.push(study); return study;
     });
     return json(res, 201, result);
@@ -527,6 +585,12 @@ async function api(req, res, url, auth = null) {
       return { accepted: true, eventId: event.id };
     });
     return json(res, 202, result);
+  }
+  const sessionAdminMatch = /^\/api\/sessions\/([^/]+)$/.exec(url.pathname);
+  if (req.method === 'DELETE' && sessionAdminMatch) {
+    requirePermission(canEdit(auth));
+    await mutate((store) => { const session = store.sessions.find((item) => item.id === sessionAdminMatch[1]); if (!session) throw Object.assign(new Error('Participant session not found.'),{status:404}); const study=store.studies.find((item)=>item.id===session.studyId); requirePermission(canAccessProject(auth,store.projects.find((project)=>project.id===study?.projectId))); store.responses=store.responses.filter((response)=>response.sessionId!==session.id); store.events=store.events.filter((event)=>event.sessionId!==session.id); store.sessions=store.sessions.filter((item)=>item.id!==session.id); });
+    return json(res,200,{deleted:true});
   }
   const completeMatch = /^\/api\/sessions\/([^/]+)\/complete$/.exec(url.pathname);
   if (req.method === 'POST' && completeMatch) {
