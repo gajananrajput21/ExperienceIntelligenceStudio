@@ -88,7 +88,7 @@ async function ensureBootstrapAccount() {
 async function ensureMembershipExpiryDefaults() {
   await mutate((store) => {
     for (const membership of store.memberships) {
-      if (membership.role !== 'owner' && !membership.accessExpiresAt) membership.accessExpiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+      if (!['owner', 'guest'].includes(membership.role) && !membership.accessExpiresAt) membership.accessExpiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
     }
   });
 }
@@ -105,12 +105,48 @@ async function currentAuth(req) {
   return user && membership && workspace ? { user, membership, workspace, session } : null;
 }
 
+// Legacy workspaces have no plan and retain their existing owner/team access.
+function trialExpired(workspace) {
+  return workspace?.plan === 'guest' && (!workspace.trialExpiresAt || Date.parse(workspace.trialExpiresAt) <= Date.now());
+}
+function requireActiveTrial(workspace) {
+  if (trialExpired(workspace)) throw Object.assign(new Error('This 30-day guest trial has ended. New tests and participation are closed. Subscriptions are coming soon.'), { status: 403 });
+}
+function studyWorkspace(store, study) {
+  const project = store.projects.find((item) => item.id === study?.projectId);
+  return store.workspaces.find((item) => item.id === project?.workspaceId);
+}
+function guestProjectQuota(store, auth) {
+  const workspace = store.workspaces.find((item) => item.id === auth.workspace.id);
+  requireActiveTrial(workspace);
+  if (workspace.plan === 'guest' && store.projects.some((item) => item.workspaceId === workspace.id)) {
+    throw Object.assign(new Error('Your guest workspace supports one prototype project. Open your existing project to create or review your test.'), { status: 409 });
+  }
+}
+function guestStudyQuota(store, auth) {
+  const workspace = store.workspaces.find((item) => item.id === auth.workspace.id);
+  requireActiveTrial(workspace);
+  if (workspace.plan === 'guest') {
+    if ((workspace.testsCreated || 0) >= 1) throw Object.assign(new Error('Your free test has already been used. You can edit the existing test; deleting it does not restore the allowance. Subscriptions are coming soon.'), { status: 409 });
+    workspace.testsCreated = (workspace.testsCreated || 0) + 1;
+  }
+}
+function participantTarget(value, workspace, fallback = 50) {
+  const target = Number(value ?? fallback);
+  const max = workspace?.plan === 'guest' ? 10 : 500;
+  if (!Number.isInteger(target) || target < 1 || target > max) throw Object.assign(new Error(`Participant target must be a whole number from 1 to ${max}.`), { status: 400 });
+  return target;
+}
+function planSummary(workspace) {
+  return workspace.plan === 'guest' ? { name: 'guest', testsLimit: 1, testsUsed: workspace.testsCreated || 0, participantLimit: 10, participantsUsed: workspace.participantsStarted || 0, expiresAt: workspace.trialExpiresAt, expired: trialExpired(workspace) } : { name: 'existing', expired: false };
+}
+
 function safeUser(user) {
   return { id: user.id, name: user.name, email: user.email, login: user.login, status: user.status, createdAt: user.createdAt };
 }
 
-function canEdit(auth) { return auth && ['owner', 'researcher'].includes(auth.membership.role); }
-function canManageTeam(auth) { return auth?.membership.role === 'owner'; }
+function canEdit(auth) { return auth && !trialExpired(auth.workspace) && ['owner', 'researcher', 'guest'].includes(auth.membership.role); }
+function canManageTeam(auth) { return auth?.membership.role === 'owner' && auth.workspace.plan !== 'guest'; }
 function canAccessProject(auth, project) {
   return project?.workspaceId === auth?.workspace.id && (auth.membership.role !== 'researcher' || project.createdBy === auth.user.id);
 }
@@ -121,7 +157,7 @@ function requirePermission(condition, message = 'You do not have permission to p
 
 function publicApiRequest(req, pathname) {
   return (req.method === 'GET' && (pathname === '/api/health' || /^\/api\/studies\/[^/]+$/.test(pathname) || /^\/api\/invites\/[^/]+$/.test(pathname)))
-    || (req.method === 'POST' && (pathname === '/api/auth/login' || /^\/api\/invites\/[^/]+\/accept$/.test(pathname) || pathname === '/api/sessions' || pathname === '/api/events' || /^\/api\/sessions\/[^/]+\/complete$/.test(pathname)));
+    || (req.method === 'POST' && (pathname === '/api/auth/login' || pathname === '/api/auth/register' || /^\/api\/invites\/[^/]+\/accept$/.test(pathname) || pathname === '/api/sessions' || pathname === '/api/events' || /^\/api\/sessions\/[^/]+\/complete$/.test(pathname)));
 }
 
 await ensureBootstrapAccount();
@@ -307,6 +343,26 @@ async function api(req, res, url, auth = null) {
     await storageHealth();
     return json(res, 200, { status: 'ok', storage: storageKind });
   }
+  if (req.method === 'POST' && url.pathname === '/api/auth/register') {
+    checkLoginRate(req);
+    const input = await jsonBody(req);
+    const email = String(input.email || '').trim().toLowerCase();
+    const name = String(input.name || '').trim().slice(0, 80);
+    const password = String(input.password || '');
+    if (name.length < 2 || email.length > 160 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return json(res, 400, { error: 'Enter your name and a valid email address.' });
+    if (password.length < 10 || password.length > 256) return json(res, 400, { error: 'Use a password between 10 and 256 characters.' });
+    const passwordHash = await hashPassword(password);
+    const rawSession = crypto.randomBytes(32).toString('base64url');
+    await mutate((store) => {
+      if (store.users.some((item) => item.email === email || item.login === email) || store.invites.some((item) => item.email === email && item.status === 'pending' && Date.parse(item.expiresAt) > Date.now())) throw Object.assign(new Error('This email already has an account or invitation. Sign in or use your invitation.'), { status: 409 });
+      const user = { id: id('user'), login: email, email, name, passwordHash, status: 'active', createdAt: now() };
+      const workspace = { id: id('workspace'), name: `${name}'s guest workspace`, createdBy: user.id, createdAt: now(), plan: 'guest', trialExpiresAt: new Date(Date.now() + 30 * 86400000).toISOString(), testsCreated: 0, participantsStarted: 0 };
+      store.users.push(user); store.workspaces.push(workspace);
+      store.memberships.push({ id: id('member'), workspaceId: workspace.id, userId: user.id, role: 'guest', createdAt: now() });
+      store.authSessions.push({ id: id('auth'), tokenHash: tokenHash(rawSession), userId: user.id, workspaceId: workspace.id, createdAt: now(), expiresAt: new Date(Date.now() + SESSION_AGE_MS).toISOString() });
+    });
+    return json(res, 201, { signedIn: true }, { 'Set-Cookie': sessionCookie(rawSession) });
+  }
   if (req.method === 'POST' && url.pathname === '/api/auth/login') {
     const rateKey = checkLoginRate(req);
     const input = await jsonBody(req);
@@ -331,7 +387,7 @@ async function api(req, res, url, auth = null) {
     return json(res, 200, { signedOut: true }, { 'Set-Cookie': clearSessionCookie() });
   }
   if (req.method === 'GET' && url.pathname === '/api/auth/me') {
-    return json(res, 200, { user: safeUser(auth.user), role: auth.membership.role, workspace: auth.workspace });
+    return json(res, 200, { user: safeUser(auth.user), role: auth.membership.role, workspace: auth.workspace, plan: planSummary(auth.workspace) });
   }
   const publicInviteMatch = /^\/api\/invites\/([^/]+)$/.exec(url.pathname);
   if (req.method === 'GET' && publicInviteMatch) {
@@ -375,7 +431,7 @@ async function api(req, res, url, auth = null) {
     const studies = store.studies.filter((study) => projectIds.has(study.projectId));
     const studyIds = new Set(studies.map((study) => study.id));
     return json(res, 200, {
-      currentUser: safeUser(auth.user), role: auth.membership.role, workspace: auth.workspace,
+      currentUser: safeUser(auth.user), role: auth.membership.role, workspace: auth.workspace, plan: planSummary(auth.workspace),
       permissions: { canEdit: canEdit(auth), canManageTeam: canManageTeam(auth) },
       projects: workspaceProjects,
       prototypes: store.prototypes.filter((prototype) => projectIds.has(prototype.projectId)).map(({ basePath, ...prototype }) => prototype),
@@ -409,10 +465,10 @@ async function api(req, res, url, auth = null) {
     const updated = await mutate((store) => {
       const study = store.studies.find((item) => item.id === studyAdminMatch[1]); if (!study) throw Object.assign(new Error('Study not found.'),{status:404});
       requirePermission(canAccessProject(auth,store.projects.find((project) => project.id === study.projectId)));
-      const participantCount = store.sessions.filter((session) => session.studyId === study.id).length; const participantTarget = Math.max(1,Math.min(500,Number(input.participantTarget || study.participantTarget || 50)));
-      if (participantTarget < participantCount) throw Object.assign(new Error(`The target cannot be lower than the ${participantCount} existing participant sessions.`),{status:409});
+      const participantCount = store.sessions.filter((session) => session.studyId === study.id).length; const target = participantTarget(input.participantTarget, auth.workspace, study.participantTarget || 50);
+      if (target < participantCount) throw Object.assign(new Error(`The target cannot be lower than the ${participantCount} existing participant sessions.`),{status:409});
       const metrics = Array.isArray(input.metrics) ? input.metrics.filter((metric) => ALLOWED_METRICS.has(metric)) : study.measurementPlan?.metrics || DEFAULT_METRICS;
-      study.title = String(input.title || study.title).trim().slice(0,100); study.participantTarget = participantTarget; study.updatedAt = now();
+      study.title = String(input.title || study.title).trim().slice(0,100); study.participantTarget = target; study.updatedAt = now();
       study.task = { ...study.task, scenario:String(input.scenario ?? study.task.scenario).slice(0,500), instruction:String(input.instruction || study.task.instruction).slice(0,500), successSelector:String(input.successSelector || study.task.successSelector).slice(0,160) };
       study.measurementPlan = { metrics:metrics.length?[...new Set(metrics)]:DEFAULT_METRICS, expectedActionCount:Math.max(0,Math.min(100,Number(input.expectedActionCount ?? study.measurementPlan?.expectedActionCount ?? 0))), targetTimeSeconds:Math.max(0,Math.min(7200,Number(input.targetTimeSeconds ?? study.measurementPlan?.targetTimeSeconds ?? 0))), customQuestion:String(input.customQuestion ?? study.measurementPlan?.customQuestion ?? '').trim().slice(0,300) };
       return study;
@@ -485,6 +541,7 @@ async function api(req, res, url, auth = null) {
   }
   if (req.method === 'POST' && url.pathname === '/api/prototypes') {
     requirePermission(canEdit(auth), 'Your Viewer role cannot create projects.');
+    guestProjectQuota(await loadStore(), auth);
     const fields = parseMultipart(await body(req, MAX_UPLOAD + 1024 * 1024), req.headers['content-type']);
     const file = fields.file;
     if (!file?.filename) return json(res, 400, { error: 'Choose an HTML or ZIP file to upload.' });
@@ -498,6 +555,7 @@ async function api(req, res, url, auth = null) {
     await savePrototypeArchive(prototypeId, file.buffer);
     const projectName = String(fields.projectName || 'Untitled project').trim().slice(0, 80);
     const result = await mutate((store) => {
+      guestProjectQuota(store, auth);
       const project = { id: id('project'), workspaceId: auth.workspace.id, createdBy: auth.user.id, name: projectName, createdAt: now() };
       const prototype = { id: prototypeId, projectId: project.id, name: originalName.replace(/\.(?:html?|zip)$/i,''), version: 1, status: 'ready', indexRoot, archiveFormat, createdAt: now() };
       store.projects.push(project); store.prototypes.push(prototype);
@@ -507,10 +565,12 @@ async function api(req, res, url, auth = null) {
   }
   if (req.method === 'POST' && url.pathname === '/api/demo') {
     requirePermission(canEdit(auth), 'Your Viewer role cannot create projects.');
+    guestProjectQuota(await loadStore(), auth);
     const sample = await fs.readFile(path.join(root, 'samples', 'support-dashboard.zip'));
     const prototypeId = id('proto'); const { indexRoot } = await extractZip(sample, prototypeId);
     await savePrototypeArchive(prototypeId, sample);
     const result = await mutate((store) => {
+      guestProjectQuota(store, auth);
       const project = { id: id('project'), workspaceId: auth.workspace.id, createdBy: auth.user.id, name: 'Support quality prototype', createdAt: now() };
       const prototype = { id: prototypeId, projectId: project.id, name: 'Support dashboard', version: 1, status: 'ready', indexRoot, createdAt: now() };
       store.projects.push(project); store.prototypes.push(prototype);
@@ -527,8 +587,9 @@ async function api(req, res, url, auth = null) {
       if (!prototype) throw Object.assign(new Error('Prototype not found.'), { status: 404 });
       const project = store.projects.find((item) => item.id === prototype.projectId);
       requirePermission(canAccessProject(auth, project));
+      guestStudyQuota(store, auth);
       const selectedMetrics = Array.isArray(input.metrics) ? input.metrics.filter((metric) => ALLOWED_METRICS.has(metric)) : DEFAULT_METRICS;
-      const study = { id: id('study'), projectId: prototype.projectId, prototypeId: prototype.id, createdBy: auth.user.id, title: String(input.title).slice(0,100), status: 'published', participantTarget: Math.max(1, Math.min(500, Number(input.participantTarget || 50))), createdAt: now(), measurementPlan: { metrics: selectedMetrics.length ? [...new Set(selectedMetrics)] : DEFAULT_METRICS, expectedActionCount: Math.max(0, Math.min(100, Number(input.expectedActionCount || 0))), targetTimeSeconds: Math.max(0, Math.min(7200, Number(input.targetTimeSeconds || 0))), customQuestion: String(input.customQuestion || '').trim().slice(0,300) }, task: { id: id('task'), scenario: String(input.scenario || '').slice(0,500), instruction: String(input.instruction).slice(0,500), successSelector: String(input.successSelector).slice(0,160) } };
+      const study = { id: id('study'), projectId: prototype.projectId, prototypeId: prototype.id, createdBy: auth.user.id, title: String(input.title).slice(0,100), status: 'published', participantTarget: participantTarget(input.participantTarget, auth.workspace, auth.workspace.plan === 'guest' ? 10 : 50), createdAt: now(), measurementPlan: { metrics: selectedMetrics.length ? [...new Set(selectedMetrics)] : DEFAULT_METRICS, expectedActionCount: Math.max(0, Math.min(100, Number(input.expectedActionCount || 0))), targetTimeSeconds: Math.max(0, Math.min(7200, Number(input.targetTimeSeconds || 0))), customQuestion: String(input.customQuestion || '').trim().slice(0,300) }, task: { id: id('task'), scenario: String(input.scenario || '').slice(0,500), instruction: String(input.instruction).slice(0,500), successSelector: String(input.successSelector).slice(0,160) } };
       store.studies.push(study); return study;
     });
     return json(res, 201, result);
@@ -537,6 +598,7 @@ async function api(req, res, url, auth = null) {
   if (req.method === 'GET' && studyMatch) {
     const store = await loadStore(); const study = store.studies.find((s) => s.id === studyMatch[1]);
     if (!study) return json(res, 404, { error: 'Study not found.' });
+    requireActiveTrial(studyWorkspace(store, study));
     const prototype = store.prototypes.find((p) => p.id === study.prototypeId);
     return json(res, 200, { study, prototype: { id: prototype.id, name: prototype.name } });
   }
@@ -567,6 +629,12 @@ async function api(req, res, url, auth = null) {
     const result = await mutate((store) => {
       const study = store.studies.find((item) => item.id === input.studyId);
       if (!study) throw Object.assign(new Error('Study not found.'), { status: 404 });
+      const workspace = studyWorkspace(store, study);
+      requireActiveTrial(workspace);
+      if (workspace?.plan === 'guest') {
+        if ((workspace.participantsStarted || 0) >= 10) throw Object.assign(new Error('This free test has reached its 10-participant allowance.'), { status: 409 });
+        workspace.participantsStarted = (workspace.participantsStarted || 0) + 1;
+      }
       const participantTarget = Number(study.participantTarget || 50);
       if (store.sessions.filter((session) => session.studyId === study.id).length >= participantTarget) throw Object.assign(new Error(`This study has reached its ${participantTarget}-participant target.`), { status: 409 });
       const session = { id: id('session'), studyId: input.studyId, startedAt: now(), endedAt: null, outcome: 'in_progress', durationMs: null, eventCount: 0 };
@@ -579,6 +647,7 @@ async function api(req, res, url, auth = null) {
     const result = await mutate((store) => {
       const session = store.sessions.find((s) => s.id === input.sessionId);
       if (!session) throw Object.assign(new Error('Session not found.'), { status: 404 });
+      requireActiveTrial(studyWorkspace(store, store.studies.find((item) => item.id === session.studyId)));
       if (store.events.some((e) => e.idempotencyKey === input.idempotencyKey)) return { accepted: true, duplicate: true };
       const event = { id: id('event'), sessionId: session.id, type: input.type, detail: input.detail || {}, elapsedMs: Number(input.elapsedMs || 0), sequence: Number(input.sequence || session.eventCount + 1), idempotencyKey: input.idempotencyKey, createdAt: now() };
       store.events.push(event); session.eventCount += 1;
@@ -598,6 +667,7 @@ async function api(req, res, url, auth = null) {
     const result = await mutate((store) => {
       const session = store.sessions.find((s) => s.id === completeMatch[1]);
       if (!session) throw Object.assign(new Error('Session not found.'), { status: 404 });
+      requireActiveTrial(studyWorkspace(store, store.studies.find((item) => item.id === session.studyId)));
       session.endedAt = now(); session.outcome = input.outcome || 'success'; session.durationMs = Number(input.durationMs || 0);
       if (input.response) store.responses.push({ id:id('response'), sessionId:session.id, ease:Number(input.response.ease || 0), confidence:Number(input.response.confidence || 0), comment:String(input.response.comment || '').slice(0,1000), customAnswer:String(input.response.customAnswer || '').slice(0,1000), createdAt:now() });
       return session;
@@ -622,6 +692,7 @@ async function handle(req, res) {
     if (protoMatch) {
       const store = await loadStore(); const prototype = store.prototypes.find((p) => p.id === protoMatch[1]);
       if (!prototype) return json(res, 404, { error: 'Prototype not found.' });
+      requireActiveTrial(studyWorkspace(store, { projectId: prototype.projectId }));
       return await servePrototype(res, prototype, protoMatch[2] || 'index.html');
     }
     const requested = url.pathname === '/' || url.pathname.startsWith('/test/') || url.pathname.startsWith('/invite/') || url.pathname === '/login' ? 'index.html' : url.pathname.slice(1);
