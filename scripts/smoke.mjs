@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -190,7 +190,61 @@ try {
   });
   if (!reactivated.ok) throw new Error('Removed member could not be safely reinvited.');
 
-  console.log('Smoke test passed: team accounts → isolated work → public participant → manager results');
+  // Customer accounts get tenant isolation and server-enforced lifetime trial limits.
+  const post = (value) => ({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) });
+  const register = async (email) => {
+    const response = await rawRequest('/api/auth/register', post({ email, name: 'Guest Tester', password: 'guest-test-password', plan: 'paid', role: 'owner' }));
+    if (response.status !== 201) throw new Error('Guest registration failed: ' + await response.text());
+    return cookieFrom(response);
+  };
+  const guestA = await register('guest-a@example.com');
+  const guestB = await register('guest-b@example.com');
+  const guestState = await request('/api/state', {}, guestA);
+  if (guestState.role !== 'guest' || guestState.plan.testsLimit !== 1 || guestState.plan.participantLimit !== 10 || guestState.permissions.canManageTeam || guestState.projects.length) throw new Error('Free guest entitlements were not assigned safely.');
+  if (Math.abs(Date.parse(guestState.plan.expiresAt) - Date.now() - 30 * 86400000) > 10000) throw new Error('Guest expiry is not 30 days from registration.');
+  if ((await rawRequest('/api/auth/register', post({email:'GUEST-A@example.com',name:'Duplicate',password:'guest-test-password'}))).status !== 409) throw new Error('Duplicate guest email was accepted.');
+  if ((await rawRequest('/api/team/invites', post({email:'invite@example.com',role:'researcher'}), guestA)).status !== 403) throw new Error('Guest could invite teammates.');
+  const guestDemo = await request('/api/demo', {method:'POST'}, guestA);
+  if ((await rawRequest('/api/demo', {method:'POST'}, guestA)).status !== 409) throw new Error('Guest could create unlimited prototype projects.');
+  const studyInput = {prototypeId:guestDemo.prototype.id,title:'Free test',instruction:'Open evaluation',successSelector:'#open-evaluation',participantTarget:10};
+  if ((await rawRequest('/api/studies',post({...studyInput,participantTarget:11}),guestA)).status !== 400) throw new Error('Guest participant target was not bounded.');
+  const attempts = await Promise.all([rawRequest('/api/studies',post(studyInput),guestA),rawRequest('/api/studies',post(studyInput),guestA)]);
+  if (attempts.map(x=>x.status).sort().join(',') !== '201,409') throw new Error('Concurrent requests bypassed one-test allowance.');
+  const freeStudy = await attempts.find(x=>x.status===201).json();
+  if ((await rawRequest(`/api/studies/${freeStudy.id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({participantTarget:11})},guestA)).status !== 400) throw new Error('Guest could raise target through edit API.');
+  for (const cookie of [guestB, ownerCookie]) {
+    if ((await rawRequest(`/api/studies/${freeStudy.id}/results`,{},cookie)).status !== 403) throw new Error('Results leaked between workspaces.');
+    if ((await rawRequest(`/api/projects/${guestDemo.project.id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:'Stolen'})},cookie)).status !== 403) throw new Error('Cross-workspace mutation succeeded.');
+  }
+  if ((await request('/api/state',{},guestB)).projects.length) throw new Error('Guest B saw Guest A projects.');
+  const starts = await Promise.all(Array.from({length:11},()=>rawRequest('/api/sessions',post({studyId:freeStudy.id}))));
+  if (starts.filter(x=>x.status===201).length !== 10 || starts.filter(x=>x.status===409).length !== 1) throw new Error('Concurrent starts bypassed participant allowance.');
+  const freeSession = await starts.find(x=>x.status===201).json();
+  await request(`/api/sessions/${freeSession.id}`,{method:'DELETE'},guestA);
+  if ((await rawRequest('/api/sessions',post({studyId:freeStudy.id}))).status !== 409) throw new Error('Deleting a participant reset the allowance.');
+  const snapshot = JSON.parse(await readFile(path.join(dataDir,'store.json'),'utf8'));
+  snapshot.workspaces.find(x=>x.id===guestState.workspace.id).trialExpiresAt = new Date(Date.now()-1000).toISOString();
+  await writeFile(path.join(dataDir,'store.json'),JSON.stringify(snapshot));
+  const expired = await request('/api/state',{},guestA);
+  if (!expired.plan.expired || expired.permissions.canEdit) throw new Error('Expired trial retained edit access.');
+  await request(`/api/studies/${freeStudy.id}/results`,{},guestA); // Read-only results remain available.
+  for (const [url,options,cookie] of [
+    ['/api/demo',{method:'POST'},guestA],
+    [`/api/studies/${freeStudy.id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:'{"title":"Late change"}'},guestA],
+    ['/api/sessions',post({studyId:freeStudy.id}), ''],
+    [`/prototype/${guestDemo.prototype.id}/index.html`,{},''],
+    [`/api/studies/${freeStudy.id}`,{},'']
+  ]) if ((await rawRequest(url,options,cookie)).status !== 403) throw new Error('Expired trial route remained open: '+url);
+  const remaining = await starts.filter(x=>x.status===201)[1].json();
+  if ((await rawRequest('/api/events',post({sessionId:remaining.id,type:'element_clicked'}))).status !== 403 || (await rawRequest(`/api/sessions/${remaining.id}/complete`,post({outcome:'success'}))).status !== 403) throw new Error('Expired trial accepted late participant data.');
+  // Trial consumption survives deleting the test itself.
+  snapshot.workspaces.find(x=>x.id===guestState.workspace.id).trialExpiresAt = new Date(Date.now()+86400000).toISOString();
+  await writeFile(path.join(dataDir,'store.json'),JSON.stringify(snapshot));
+  await request(`/api/studies/${freeStudy.id}`,{method:'DELETE'},guestA);
+  if ((await rawRequest('/api/studies',post(studyInput),guestA)).status !== 409) throw new Error('Deleting the study reset the free allowance.');
+  if ((await request('/api/state',{},guestA)).plan.testsUsed !== 1) throw new Error('Trial consumption was not persisted.');
+
+  console.log('Smoke test passed: existing admin/team flow + isolated guest trials, quotas, concurrency, expiry and deletion bypass protection');
 } finally {
   server.kill('SIGTERM');
   await rm(dataDir, { recursive: true, force: true });

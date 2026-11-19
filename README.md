@@ -93,3 +93,15 @@ The creator workspace and results APIs use account sessions and server-enforced 
 - No participant recruitment or AI-generated findings
 
 These are deliberate boundaries. The POC validates the hardest product loop before cloud architecture and team administration are introduced.
+
+## Free guest pilot
+
+Visitors can choose **Try free** on the sign-in screen and register with a name, email and password. Each account gets a separate guest workspace with one test, up to 10 participant starts, and 30 days from registration. One prototype project can be kept at a time. Teammate invitations are unavailable to guests. Trial entitlements are server-controlled; client-provided roles or plans do not grant access. Registration is rate-limited and duplicate emails cannot restart the trial.
+
+The test allowance is consumed at publication. Trial test and participant counters persist independently of records: deletion does not reset them. Participant starts include unfinished attempts. Concurrent requests are serialized by the existing storage mutation transaction. At expiry, test mutations, prototype access and participant collection close. Guests can still sign in to review results; no automatic deletion is scheduled.
+
+Existing founder and invited team workspaces retain their roles, invitations, project visibility and limits. Every new guest workspace is isolated from these and from other guests. **Help guide** is available at the top of the workspace and on sign-in/sign-up.
+
+Subscriptions, checkout, paid team administration, conversion to a subscription admin, and an Upgrade button are deliberately deferred. Future entitlements must be assigned only after a trusted billing confirmation; never from registration input. No paid tier is purchasable in this MVP.
+
+Operational limits: registration currently has no email verification or self-service password recovery. A unique email is an account identifier, not proof of email ownership; separate emails can create separate trials. Before a broad public launch, add email verification and abuse monitoring. Production requires existing ADMIN_PASSWORD and DATABASE_URL; no new billing settings or database migration are required.
